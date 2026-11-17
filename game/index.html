@@ -1,0 +1,836 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>The Last Firefly — She Saved the Brightest Light for You</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #070a24; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  /* Read aloud, never shown: the status line screen readers announce. */
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="The Last Firefly: guide Luma the firefly with the mouse or arrow keys. Catch falling star-drops, carry up to three, and touch dark lanterns to light them. Light all nine lanterns before dawn, then fly to the great lantern on the hill — the one she saved for you."></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<script type="module">
+// ============================================================================
+// THE LAST FIREFLY — She Saved the Brightest Light for You
+//
+// A small game about Luma, the last firefly of the valley. Every night she
+// gathers fallen star-drops and relights the nine lanterns of the meadow
+// before dawn. Tonight is the last night of the season, and on the hill
+// stands a tenth lantern — the great one, with the ribbon — that she has
+// been saving all season for one particular guest: the one who came to
+// judge her work. For you.
+//
+// Play: mouse or WASD / arrow keys to fly. Catch star-drops (carry up to
+// three), touch a dark lantern to light it. Shadow wisps knock a carried
+// star loose. Light all nine before the dawn bar fills, then fly to the
+// great lantern on the hill. P pauses, M mutes, R restarts.
+//
+// Everything is drawn and synthesized in code: no images, no fonts, no
+// network. The ?shot=<scene>&seed=<n> scenes exist so the maker can take
+// the entry's screenshots; ?debug=1 exposes window.__firefly for tests.
+// ============================================================================
+
+const W = 1280, H = 720;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+// ---- deterministic RNG (mulberry32) ---------------------------------------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const params = new URLSearchParams(location.search);
+const SEED = Number(params.get('seed') ?? 1) >>> 0;
+let rng = mulberry32(SEED);
+const rand = (a, b) => a + rng() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+function smoothstep(a, b, x) { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
+function mixc(c1, c2, t) {
+  return [Math.round(lerp(c1[0], c2[0], t)), Math.round(lerp(c1[1], c2[1], t)), Math.round(lerp(c1[2], c2[2], t))];
+}
+const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+
+// ---- audio: tiny WebAudio synth, created on first gesture ------------------
+let AC = null, muted = false;
+function audio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume().catch(() => {}); return AC; }
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch { AC = null; }
+  return AC;
+}
+function tone(freq, t0, dur, type = 'sine', gain = 0.12, slideTo = null) {
+  const ac = audio(); if (!ac || muted) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  const t = ac.currentTime + t0;
+  o.type = type; o.frequency.setValueAtTime(freq, t);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(ac.destination);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+const sfx = {
+  catchStar() { tone(880, 0, 0.18, 'sine', 0.10, 1560); },
+  drop() { tone(520, 0, 0.2, 'sine', 0.08, 240); },
+  light() { tone(523.25, 0, 0.5, 'triangle', 0.10); tone(659.25, 0.06, 0.5, 'triangle', 0.10); tone(783.99, 0.12, 0.7, 'triangle', 0.11); },
+  finale() { [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach((f, i) => tone(f, i * 0.13, 0.9, 'triangle', 0.10)); },
+  bump() { tone(180, 0, 0.16, 'sawtooth', 0.05, 90); },
+};
+
+// ---- input ------------------------------------------------------------------
+const input = { mouseX: W * 0.4, mouseY: H * 0.45, mouseSeen: false, keys: new Set(), clicked: false };
+addEventListener('mousemove', (e) => {
+  const r = canvas.getBoundingClientRect();
+  input.mouseX = (e.clientX - r.left) / r.width * W;
+  input.mouseY = (e.clientY - r.top) / r.height * H;
+  input.mouseSeen = true;
+});
+addEventListener('mousedown', () => { input.clicked = true; audio(); });
+addEventListener('keydown', (e) => {
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+  input.keys.add(e.key.toLowerCase());
+  if (e.key === 'Enter') input.clicked = true;
+  if (e.key.toLowerCase() === 'm') muted = !muted;
+  if (e.key.toLowerCase() === 'p' && world.screen === 'play') world.paused = !world.paused;
+  if (e.key.toLowerCase() === 'r' && (world.screen === 'win' || world.screen === 'lose' || world.screen === 'play')) startGame(world.seed + 1);
+});
+addEventListener('keyup', (e) => input.keys.delete(e.key.toLowerCase()));
+
+// ---- world layout -----------------------------------------------------------
+function groundY(x) {
+  return 618 + 10 * Math.sin(x * 0.006 + 0.8) - 148 * smoothstep(1000, 1180, x);
+}
+const LANTERN_X = [86, 204, 322, 440, 556, 668, 782, 892, 992];
+const BIG = { x: 1152, y: 0 }; BIG.y = groundY(BIG.x);
+const NIGHT_SECONDS = 150;
+
+const world = {
+  screen: 'title', // title | play | finale | win | lose
+  paused: false,
+  seed: SEED,
+  t: 0,            // global animation clock (s)
+  timeLeft: NIGHT_SECONDS,
+  score: 0,
+  combo: 1, comboTimer: 0,
+  lanternsLit: 0,
+  carried: 0,
+  invuln: 0,
+  shake: 0,
+  finaleT: 0,
+  spawnTimer: 0,
+  announced: '',
+  luma: { x: W * 0.4, y: H * 0.45, vx: 0, vy: 0, wing: 0, trail: [] },
+  lanterns: [],
+  stars: [],     // falling / resting star-drops
+  wisps: [],
+  particles: [],
+  fireflies: [],
+  skyStars: [],
+};
+
+function buildScenery() {
+  world.skyStars = [];
+  for (let i = 0; i < 130; i++) world.skyStars.push({ x: rng() * W, y: rng() * 380, r: rand(0.6, 1.9), ph: rng() * Math.PI * 2 });
+  world.fireflies = [];
+  for (let i = 0; i < 26; i++) world.fireflies.push({ x: rng() * W, y: rand(300, 640), ph: rng() * Math.PI * 2, sp: rand(0.3, 0.9) });
+}
+function buildLanterns() {
+  world.lanterns = LANTERN_X.map((x, i) => ({ x, y: groundY(x), lit: false, flick: rng() * Math.PI * 2, id: i }));
+}
+function buildWisps() {
+  world.wisps = [
+    { x: 300, y: 240, ph: 0.0, sp: 0.55, amp: 90 },
+    { x: 700, y: 180, ph: 2.1, sp: 0.42, amp: 120 },
+    { x: 1010, y: 300, ph: 4.2, sp: 0.5, amp: 70 },
+  ];
+}
+function resetWorld(seed) {
+  rng = mulberry32(seed);
+  world.seed = seed;
+  world.timeLeft = NIGHT_SECONDS;
+  world.score = 0; world.combo = 1; world.comboTimer = 0;
+  world.lanternsLit = 0; world.carried = 0;
+  world.invuln = 0; world.shake = 0; world.finaleT = 0; world.spawnTimer = 0.6;
+  world.luma = { x: W * 0.4, y: H * 0.45, vx: 0, vy: 0, wing: 0, trail: [] };
+  world.stars = []; world.particles = [];
+  buildScenery(); buildLanterns(); buildWisps();
+}
+function startGame(seed) {
+  resetWorld(seed);
+  world.screen = 'play';
+  world.paused = false;
+  announce('Light all nine lanterns before dawn, then fly to the great lantern on the hill.');
+}
+function announce(text) {
+  if (world.announced !== text) { world.announced = text; statusEl.textContent = text; }
+}
+resetWorld(SEED);
+
+// ---- particles ----------------------------------------------------------------
+function burst(x, y, n, color, speed = 130, life = 0.9, size = 3) {
+  for (let i = 0; i < n; i++) {
+    const a = rng() * Math.PI * 2, v = rand(0.25, 1) * speed;
+    world.particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 30, life: rand(0.5, 1) * life, maxLife: life, color, size: rand(1.2, size) });
+  }
+}
+
+// ---- update ---------------------------------------------------------------------
+function spawnStar(x = null) {
+  world.stars.push({
+    x: x ?? rand(50, 1080), y: -24, vy: rand(52, 82), swayPh: rng() * Math.PI * 2, swayAmp: rand(8, 22),
+    resting: false, restAge: 0, caught: false,
+  });
+}
+function update(dt) {
+  world.t += dt;
+  // ambient fireflies always drift
+  for (const f of world.fireflies) {
+    f.x += Math.sin(world.t * f.sp + f.ph) * 12 * dt;
+    f.y += Math.cos(world.t * f.sp * 0.8 + f.ph) * 8 * dt;
+  }
+  for (const p of world.particles) {
+    p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 60 * dt; p.vx *= (1 - 1.6 * dt);
+  }
+  world.particles = world.particles.filter((p) => p.life > 0);
+  if (world.screen !== 'play' || world.paused) { input.clicked = false; return; }
+
+  world.timeLeft -= dt;
+  if (world.comboTimer > 0) { world.comboTimer -= dt; if (world.comboTimer <= 0) world.combo = 1; }
+  if (world.invuln > 0) world.invuln -= dt;
+  if (world.shake > 0) world.shake = Math.max(0, world.shake - dt * 2.4);
+
+  // Luma movement: keys take over, otherwise follow the mouse.
+  const L = world.luma;
+  let tx = null, ty = null;
+  const sp = 340;
+  let kx = 0, ky = 0;
+  if (input.keys.has('a') || input.keys.has('arrowleft')) kx -= 1;
+  if (input.keys.has('d') || input.keys.has('arrowright')) kx += 1;
+  if (input.keys.has('w') || input.keys.has('arrowup')) ky -= 1;
+  if (input.keys.has('s') || input.keys.has('arrowdown')) ky += 1;
+  if (kx || ky) { tx = L.x + kx * 120; ty = L.y + ky * 120; L.vx = kx * sp; L.vy = ky * sp; }
+  else if (input.mouseSeen) { tx = input.mouseX; ty = input.mouseY; }
+  if (tx !== null) {
+    const dx = tx - L.x, dy = ty - L.y, d = Math.hypot(dx, dy);
+    if (!(kx || ky)) {
+      const pull = clamp(d / 90, 0, 1);
+      L.vx = lerp(L.vx, dx * 6 * pull, 0.35);
+      L.vy = lerp(L.vy, dy * 6 * pull, 0.35);
+    }
+    void d;
+  }
+  L.x += L.vx * dt; L.y += L.vy * dt;
+  L.x = clamp(L.x, 26, W - 26);
+  L.y = clamp(L.y, 52, groundY(L.x) - 26);
+  L.wing += dt * (14 + Math.hypot(L.vx, L.vy) * 0.03);
+  L.trail.push({ x: L.x - 8, y: L.y + 8, life: 0.5 });
+  if (L.trail.length > 22) L.trail.shift();
+  for (const tr of L.trail) tr.life -= dt;
+  L.trail = L.trail.filter((tr) => tr.life > 0);
+
+  // star-drops
+  world.spawnTimer -= dt;
+  if (world.spawnTimer <= 0 && world.stars.length < 7) { spawnStar(); world.spawnTimer = rand(1.2, 2.1); }
+  for (const s of world.stars) {
+    if (!s.resting) {
+      s.y += s.vy * dt;
+      s.x += Math.sin(world.t * 1.7 + s.swayPh) * s.swayAmp * dt;
+      const gy = groundY(s.x) - 8;
+      if (s.y >= gy) { s.y = gy; s.resting = true; }
+    } else {
+      s.restAge += dt;
+    }
+    // catch
+    if (world.carried < 3 && dist(L.x, L.y, s.x, s.y) < 36) {
+      s.caught = true; world.carried++;
+      world.score += 10;
+      burst(s.x, s.y, 8, [255, 226, 140], 90, 0.6, 2.4);
+      sfx.catchStar();
+    }
+  }
+  world.stars = world.stars.filter((s) => !s.caught && !(s.resting && s.restAge > 6));
+
+  // wisps drift on slow sine paths
+  for (const wisp of world.wisps) {
+    wisp.ph += dt * wisp.sp;
+    wisp.x += Math.sin(wisp.ph) * 26 * dt;
+    wisp.y += Math.cos(wisp.ph * 0.9) * 16 * dt;
+    wisp.x = clamp(wisp.x, 60, 1120); wisp.y = clamp(wisp.y, 90, 470);
+    if (world.carried > 0 && world.invuln <= 0 && dist(L.x, L.y, wisp.x, wisp.y) < 34) {
+      world.carried--; world.invuln = 1.4; world.shake = 0.7;
+      spawnStar(L.x); const s = world.stars[world.stars.length - 1];
+      s.y = L.y; s.vy = 30;
+      burst(L.x, L.y, 10, [150, 130, 220], 110, 0.7, 2.6);
+      sfx.bump(); sfx.drop();
+      announce('A shadow wisp knocked a star loose!');
+    }
+  }
+
+  // deliver to lanterns
+  for (const lan of world.lanterns) {
+    if (!lan.lit && world.carried > 0 && dist(L.x, L.y, lan.x, lan.y - 64) < 50) {
+      lan.lit = true; world.carried--; world.lanternsLit++;
+      world.score += 100 * world.combo;
+      world.combo = Math.min(4, world.combo + 1); world.comboTimer = 4;
+      burst(lan.x, lan.y - 64, 26, [255, 196, 92], 170, 1.1, 3.4);
+      sfx.light();
+      if (world.lanternsLit === 9) announce('All nine are lit. The great lantern on the hill is waiting — that one is for you.');
+      else announce(`${world.lanternsLit} of 9 lanterns lit.`);
+    }
+  }
+
+  // the great lantern
+  if (world.lanternsLit === 9 && dist(L.x, L.y, BIG.x, BIG.y - 108) < 64) {
+    world.screen = 'finale'; world.finaleT = 0;
+    burst(BIG.x, BIG.y - 108, 60, [255, 214, 120], 240, 1.6, 4);
+    sfx.finale();
+    announce('She lights the great lantern — the one she saved for you.');
+  }
+
+  if (world.timeLeft <= 0 && world.screen === 'play') {
+    world.screen = 'lose';
+    announce('Dawn came first. Luma will try again tomorrow night.');
+  }
+  input.clicked = false;
+}
+
+function updateFinale(dt) {
+  world.t += dt;
+  world.finaleT += dt;
+  for (const p of world.particles) { p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 40 * dt; }
+  world.particles = world.particles.filter((p) => p.life > 0);
+  if (world.finaleT > 0.4 && world.finaleT % 0.5 < dt) burst(BIG.x + rand(-30, 30), BIG.y - 108 + rand(-24, 24), 8, [255, 220, 140], 120, 1.2, 3);
+  const L = world.luma;
+  L.x = lerp(L.x, BIG.x - 64, dt * 1.6); L.y = lerp(L.y, BIG.y - 128, dt * 1.6); L.wing += dt * 16;
+  if (world.finaleT >= 3.2) {
+    world.screen = 'win';
+    world.score += Math.round(world.timeLeft) * 5;
+    announce('You win. The great lantern is lit, and it is yours.');
+  }
+}
+
+// ---- scenery constants (fixed seed: identical every run) -----------------------
+const deco = (() => {
+  const r = mulberry32(20261117);
+  const pines = [];
+  for (let i = 0; i < 26; i++) pines.push({ x: 20 + r() * 1240, s: 0.6 + r() * 1.1, y: 486 + r() * 60 });
+  const flowers = [];
+  for (let i = 0; i < 90; i++) flowers.push({ x: r() * W, dx: r() * 14 - 7, c: [[255, 170, 190], [255, 226, 140], [190, 200, 255], [255, 255, 255]][Math.floor(r() * 4)] });
+  const grass = [];
+  for (let i = 0; i < 240; i++) grass.push({ x: r() * W, h: 6 + r() * 12, lean: r() * 4 - 2 });
+  return { pines, flowers, grass };
+})();
+
+// ---- palettes -------------------------------------------------------------------
+const PAL = {
+  skyNight: [[9, 12, 44], [33, 23, 84], [86, 43, 112], [158, 76, 110]],
+  skyDawn: [[40, 54, 104], [112, 76, 130], [198, 112, 110], [250, 196, 112]],
+  farNight: [27, 31, 68], farDawn: [86, 74, 116],
+  midNight: [17, 38, 46], midDawn: [58, 80, 88],
+  meadowTopNight: [17, 56, 40], meadowTopDawn: [42, 92, 56],
+  meadowBotNight: [7, 28, 20], meadowBotDawn: [20, 56, 36],
+};
+function dawnAmount() {
+  if (world.screen === 'title') return 0.08;
+  if (world.screen === 'lose') return 1;
+  if (world.screen === 'finale' || world.screen === 'win') return 0.3;
+  return clamp(1 - world.timeLeft / NIGHT_SECONDS, 0, 0.94);
+}
+
+function drawSky(dawn) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  for (let i = 0; i < 4; i++) g.addColorStop(i / 3, rgba(mixc(PAL.skyNight[i], PAL.skyDawn[i], dawn), 1));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // stars
+  for (const s of world.skyStars) {
+    const tw = 0.55 + 0.45 * Math.sin(world.t * 1.8 + s.ph);
+    ctx.fillStyle = `rgba(235,238,255,${(0.75 * tw * (1 - dawn * 0.88)).toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  // moon, sinking as dawn comes
+  const mx = 1064 - dawn * 90, my = 92 + dawn * 190;
+  const mg = ctx.createRadialGradient(mx, my, 8, mx, my, 120);
+  mg.addColorStop(0, `rgba(250,244,205,${0.5 * (1 - dawn * 0.7)})`); mg.addColorStop(1, 'rgba(250,244,205,0)');
+  ctx.fillStyle = mg; ctx.beginPath(); ctx.arc(mx, my, 120, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = rgba([243, 238, 205], 1 - dawn * 0.45);
+  ctx.beginPath(); ctx.arc(mx, my, 40, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = rgba(mixc(PAL.skyNight[1], PAL.skyDawn[1], dawn), 0.10);
+  ctx.beginPath(); ctx.arc(mx - 16, my - 6, 6, 0, Math.PI * 2); ctx.arc(mx + 12, my + 16, 4.5, 0, Math.PI * 2); ctx.arc(mx + 14, my - 15, 3.5, 0, Math.PI * 2); ctx.arc(mx - 4, my + 20, 3, 0, Math.PI * 2); ctx.fill();
+}
+
+function ridge(baseY, amp, color, seedOff) {
+  ctx.fillStyle = rgba(color, 1);
+  ctx.beginPath(); ctx.moveTo(0, H);
+  for (let x = 0; x <= W; x += 16) {
+    const y = baseY + Math.sin(x * 0.004 + seedOff) * amp + Math.sin(x * 0.011 + seedOff * 2) * amp * 0.4;
+    ctx.lineTo(x, y);
+  }
+  ctx.lineTo(W, H); ctx.closePath(); ctx.fill();
+}
+function drawPine(x, y, s, color) {
+  ctx.fillStyle = rgba(color, 1);
+  ctx.fillRect(x - 2 * s, y - 8 * s, 4 * s, 10 * s);
+  for (let i = 0; i < 3; i++) {
+    const w = (26 - i * 6) * s, yy = y - 6 * s - i * 13 * s;
+    ctx.beginPath(); ctx.moveTo(x - w / 2, yy); ctx.lineTo(x + w / 2, yy); ctx.lineTo(x, yy - 15 * s); ctx.closePath(); ctx.fill();
+  }
+}
+function drawHills(dawn) {
+  ridge(430, 26, mixc(PAL.farNight, PAL.farDawn, dawn), 1.7);
+  ridge(500, 20, mixc(PAL.midNight, PAL.midDawn, dawn), 4.2);
+  const c = mixc(PAL.midNight, PAL.midDawn, dawn);
+  for (const p of deco.pines) drawPine(p.x, p.y, p.s, c);
+}
+function drawMeadow(dawn) {
+  ctx.beginPath(); ctx.moveTo(0, H);
+  for (let x = 0; x <= W; x += 16) ctx.lineTo(x, groundY(x));
+  ctx.lineTo(W, H); ctx.closePath();
+  const g = ctx.createLinearGradient(0, 440, 0, H);
+  g.addColorStop(0, rgba(mixc(PAL.meadowTopNight, PAL.meadowTopDawn, dawn), 1));
+  g.addColorStop(1, rgba(mixc(PAL.meadowBotNight, PAL.meadowBotDawn, dawn), 1));
+  ctx.fillStyle = g; ctx.fill();
+  // grass strokes + flowers
+  ctx.strokeStyle = rgba(mixc([30, 84, 54], [66, 122, 74], dawn), 0.8);
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  for (const gr of deco.grass) {
+    const gy = groundY(gr.x) + 8 + (gr.x % 40);
+    if (gy > H - 4) continue;
+    ctx.moveTo(gr.x, gy); ctx.lineTo(gr.x + gr.lean, gy - gr.h);
+  }
+  ctx.stroke();
+  for (const f of deco.flowers) {
+    const gy = groundY(f.x) + 14 + (f.x % 26);
+    if (gy > H - 6) continue;
+    ctx.fillStyle = rgba(f.c, 0.5 + dawn * 0.4);
+    ctx.beginPath(); ctx.arc(f.x, gy, 1.8, 0, Math.PI * 2); ctx.fill();
+  }
+  // pools of light under lit lanterns
+  for (const lan of world.lanterns) {
+    if (!lan.lit) continue;
+    const fl = 0.9 + 0.1 * Math.sin(world.t * 7 + lan.flick);
+    const rg = ctx.createRadialGradient(lan.x, lan.y - 60, 4, lan.x, lan.y - 30, 130);
+    rg.addColorStop(0, `rgba(255,196,92,${0.34 * fl})`); rg.addColorStop(1, 'rgba(255,196,92,0)');
+    ctx.fillStyle = rg;
+    ctx.beginPath(); ctx.ellipse(lan.x, lan.y - 26, 130, 52, 0, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function lanternBody(x, yTop, s, lit, flick, big) {
+  // hanging lantern whose glass center is at (x, yTop + 26*s)
+  const gy = yTop + 26 * s;
+  if (lit) {
+    const fl = 0.9 + 0.1 * Math.sin(world.t * 7 + flick);
+    const rg = ctx.createRadialGradient(x, gy, 2, x, gy, (big ? 120 : 74) * s);
+    rg.addColorStop(0, `rgba(255,214,120,${0.85 * fl})`); rg.addColorStop(0.4, `rgba(255,178,84,${0.4 * fl})`); rg.addColorStop(1, 'rgba(255,178,84,0)');
+    ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(x, gy, (big ? 120 : 74) * s, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.fillStyle = '#241a12';
+  ctx.fillRect(x - 15 * s, yTop, 30 * s, 6 * s);                       // cap
+  ctx.beginPath(); ctx.moveTo(x - 4 * s, yTop); ctx.lineTo(x, yTop - 9 * s); ctx.lineTo(x + 4 * s, yTop); ctx.closePath(); ctx.fill(); // finial
+  const glass = ctx.createLinearGradient(x, yTop + 6 * s, x, yTop + 46 * s);
+  if (lit) { glass.addColorStop(0, '#ffe9a8'); glass.addColorStop(0.55, '#ffc45e'); glass.addColorStop(1, '#f59a3c'); }
+  else { glass.addColorStop(0, '#3d4666'); glass.addColorStop(1, '#232a44'); }
+  ctx.fillStyle = glass;
+  ctx.beginPath();
+  ctx.moveTo(x - 12 * s, yTop + 7 * s); ctx.lineTo(x + 12 * s, yTop + 7 * s);
+  ctx.lineTo(x + 9 * s, yTop + 45 * s); ctx.lineTo(x - 9 * s, yTop + 45 * s); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#171008'; ctx.lineWidth = 2 * s;
+  ctx.beginPath(); ctx.moveTo(x, yTop + 7 * s); ctx.lineTo(x, yTop + 45 * s);
+  ctx.moveTo(x - 12 * s, yTop + 7 * s); ctx.lineTo(x + 12 * s, yTop + 7 * s); ctx.stroke();
+  ctx.fillStyle = '#241a12';
+  ctx.fillRect(x - 13 * s, yTop + 45 * s, 26 * s, 5 * s);              // base
+  if (lit) { // flame heart
+    ctx.fillStyle = `rgba(255,252,230,${0.9 + 0.1 * Math.sin(world.t * 9 + flick)})`;
+    ctx.beginPath(); ctx.ellipse(x, gy + 4 * s, 3.4 * s, 5.4 * s, 0, 0, Math.PI * 2); ctx.fill();
+  }
+}
+function drawLantern(lan) {
+  const { x, y } = lan;
+  ctx.fillStyle = '#1d1409';
+  ctx.fillRect(x - 3, y - 58, 6, 58);                                   // post
+  ctx.fillRect(x - 3, y - 58, 20, 5);                                   // arm
+  ctx.strokeStyle = '#1d1409'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x + 14, y - 55); ctx.lineTo(x + 14, y - 48); ctx.stroke();
+  lanternBody(x + 14, y - 48, 0.62, lan.lit, lan.flick, false);
+  lan.cx = x + 14; lan.cy = y - 48 + 16;
+}
+function drawBigLantern() {
+  const x = BIG.x, base = BIG.y;
+  // stone base + twin posts
+  ctx.fillStyle = '#2c2f45';
+  ctx.beginPath(); ctx.ellipse(x, base + 4, 74, 14, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#1d1409';
+  ctx.fillRect(x - 40, base - 96, 7, 96); ctx.fillRect(x + 33, base - 96, 7, 96);
+  ctx.fillRect(x - 48, base - 104, 96, 9);
+  const lit = world.screen === 'finale' || world.screen === 'win';
+  const waiting = world.lanternsLit === 9 && world.screen === 'play';
+  if (waiting) { // beacon pulse: come here
+    const p = (world.t % 1.6) / 1.6;
+    ctx.strokeStyle = `rgba(255,214,120,${0.55 * (1 - p)})`; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(x, base - 70, 20 + p * 56, 0, Math.PI * 2); ctx.stroke();
+  }
+  if (lit) {
+    const bloom = world.screen === 'win' ? 1 : clamp(world.finaleT / 2.4, 0, 1);
+    const rg = ctx.createRadialGradient(x, base - 70, 6, x, base - 70, 300 * bloom + 40);
+    rg.addColorStop(0, `rgba(255,224,150,${0.75 * bloom})`); rg.addColorStop(0.5, `rgba(255,186,92,${0.3 * bloom})`); rg.addColorStop(1, 'rgba(255,186,92,0)');
+    ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(x, base - 70, 300 * bloom + 40, 0, Math.PI * 2); ctx.fill();
+  }
+  lanternBody(x, base - 96, 1.5, lit, 1.3, true);
+  // the ribbon — she tied it on for the guest
+  ctx.fillStyle = '#c73e54';
+  const rx = x, ry = base - 108;
+  ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(rx - 13, ry - 8); ctx.lineTo(rx - 12, ry + 7); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(rx + 13, ry - 8); ctx.lineTo(rx + 12, ry + 7); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(rx, ry, 4.4, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(rx - 2, ry + 3); ctx.lineTo(rx - 7, ry + 17); ctx.lineTo(rx - 1, ry + 15); ctx.lineTo(rx + 2, ry + 5); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(rx + 2, ry + 3); ctx.lineTo(rx + 8, ry + 16); ctx.lineTo(rx + 2, ry + 15); ctx.lineTo(rx - 1, ry + 5); ctx.closePath(); ctx.fill();
+}
+
+function drawStarDrop(s) {
+  const fade = s.resting && s.restAge > 4.4 ? (Math.sin(world.t * 14) > 0 ? 0.35 : 0.9) : 1;
+  const pulse = 0.85 + 0.15 * Math.sin(world.t * 4 + s.swayPh);
+  ctx.save(); ctx.globalAlpha = fade;
+  const rg = ctx.createRadialGradient(s.x, s.y, 1, s.x, s.y, 20 * pulse);
+  rg.addColorStop(0, 'rgba(255,244,190,0.95)'); rg.addColorStop(0.35, 'rgba(255,214,110,0.55)'); rg.addColorStop(1, 'rgba(255,214,110,0)');
+  ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(s.x, s.y, 20 * pulse, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff6d8';
+  ctx.beginPath();
+  const R = 7 * pulse, r = 2.8 * pulse;
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2 - Math.PI / 2, rad = i % 2 === 0 ? R : r;
+    const px = s.x + Math.cos(a) * rad, py = s.y + Math.sin(a) * rad;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawWisp(w) {
+  ctx.save();
+  const bob = Math.sin(world.t * 1.4 + w.ph) * 4;
+  const rg = ctx.createRadialGradient(w.x, w.y + bob, 2, w.x, w.y + bob, 30);
+  rg.addColorStop(0, 'rgba(88,72,150,0.85)'); rg.addColorStop(0.7, 'rgba(52,40,102,0.55)'); rg.addColorStop(1, 'rgba(52,40,102,0)');
+  ctx.fillStyle = rg;
+  ctx.beginPath(); ctx.arc(w.x, w.y + bob, 30, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(w.x - 16, w.y + 8 + bob, 17, 0, Math.PI * 2); ctx.arc(w.x + 16, w.y + 9 + bob, 15, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = 'rgba(226,220,255,0.95)';
+  ctx.beginPath(); ctx.arc(w.x - 8, w.y - 2 + bob, 3.1, 0, Math.PI * 2); ctx.arc(w.x + 8, w.y - 2 + bob, 3.1, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+function drawLuma() {
+  const L = world.luma;
+  // sparkle trail
+  for (const tr of L.trail) {
+    ctx.fillStyle = `rgba(255,226,140,${(tr.life * 0.55).toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(tr.x, tr.y, 2.2, 0, Math.PI * 2); ctx.fill();
+  }
+  const blink = world.invuln > 0 && Math.sin(world.t * 26) > 0;
+  ctx.save(); if (blink) ctx.globalAlpha = 0.35;
+  // wings
+  const flap = Math.sin(L.wing) * 0.55;
+  ctx.fillStyle = 'rgba(214,232,255,0.75)';
+  for (const side of [-1, 1]) {
+    ctx.save(); ctx.translate(L.x + side * 4, L.y - 6); ctx.rotate(side * (0.5 + flap * 0.5));
+    ctx.beginPath(); ctx.ellipse(side * 11, 0, 13, 5.4, side * 0.5, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+  }
+  // abdomen glow
+  const pulse = 0.8 + 0.2 * Math.sin(world.t * 5);
+  const rg = ctx.createRadialGradient(L.x - 2, L.y + 7, 1, L.x - 2, L.y + 7, 30 * pulse);
+  rg.addColorStop(0, 'rgba(255,240,170,0.95)'); rg.addColorStop(0.4, 'rgba(255,205,92,0.5)'); rg.addColorStop(1, 'rgba(255,205,92,0)');
+  ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(L.x - 2, L.y + 7, 30 * pulse, 0, Math.PI * 2); ctx.fill();
+  // body + head
+  ctx.fillStyle = '#5a4026';
+  ctx.beginPath(); ctx.ellipse(L.x, L.y + 3, 10, 12, 0.25, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#6d4e2e';
+  ctx.beginPath(); ctx.arc(L.x + 6, L.y - 8, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#3c2a16'; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(L.x + 9, L.y - 14); ctx.quadraticCurveTo(L.x + 15, L.y - 21, L.x + 19, L.y - 20); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(L.x + 5, L.y - 15); ctx.quadraticCurveTo(L.x + 8, L.y - 23, L.x + 13, L.y - 24); ctx.stroke();
+  ctx.fillStyle = '#ffd873';
+  ctx.beginPath(); ctx.arc(L.x + 19, L.y - 20, 2, 0, Math.PI * 2); ctx.arc(L.x + 13, L.y - 24, 2, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff3cf';
+  ctx.beginPath(); ctx.ellipse(L.x - 3, L.y + 8, 4.6, 6.2, 0.2, 0, Math.PI * 2); ctx.fill();
+  // eye
+  ctx.fillStyle = '#1c1410';
+  ctx.beginPath(); ctx.arc(L.x + 9, L.y - 8, 1.9, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  // carried star orbs orbit her
+  for (let i = 0; i < world.carried; i++) {
+    const a = world.t * 2.6 + (i * Math.PI * 2) / 3;
+    const ox = L.x + Math.cos(a) * 24, oy = L.y - 4 + Math.sin(a) * 13;
+    const rg2 = ctx.createRadialGradient(ox, oy, 0.5, ox, oy, 10);
+    rg2.addColorStop(0, 'rgba(255,246,200,0.95)'); rg2.addColorStop(1, 'rgba(255,214,110,0)');
+    ctx.fillStyle = rg2; ctx.beginPath(); ctx.arc(ox, oy, 10, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff6d8'; ctx.beginPath(); ctx.arc(ox, oy, 2.6, 0, Math.PI * 2); ctx.fill();
+  }
+}
+function drawFireflies() {
+  for (const f of world.fireflies) {
+    const a = 0.25 + 0.55 * (0.5 + 0.5 * Math.sin(world.t * 1.3 + f.ph * 3));
+    ctx.fillStyle = `rgba(255,232,150,${a.toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(f.x, f.y, 1.7, 0, Math.PI * 2); ctx.fill();
+  }
+}
+function drawParticles() {
+  for (const p of world.particles) {
+    ctx.fillStyle = rgba(p.color, clamp(p.life / p.maxLife, 0, 1) * 0.9);
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// ---- HUD + text ------------------------------------------------------------------
+function text(str, x, y, size, color, align = 'left', font = 'Georgia, "Times New Roman", serif', alpha = 1) {
+  ctx.save(); ctx.globalAlpha = alpha;
+  ctx.font = `${size}px ${font}`; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillStyle = color; ctx.fillText(str, x, y);
+  ctx.restore();
+}
+function drawHUD() {
+  // lantern pips
+  for (let i = 0; i < 9; i++) {
+    const x = 30 + i * 24, y = 30;
+    ctx.fillStyle = world.lanterns[i].lit ? '#ffc45e' : 'rgba(120,130,170,0.5)';
+    ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2); ctx.fill();
+    if (world.lanterns[i].lit) { ctx.fillStyle = '#fff3cf'; ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill(); }
+  }
+  text(`${world.lanternsLit} / 9 lanterns`, 30, 56, 15, '#e8e4ff', 'left', 'system-ui, sans-serif');
+  // carried
+  for (let i = 0; i < 3; i++) {
+    const x = 34 + i * 22, y = 84;
+    ctx.fillStyle = i < world.carried ? '#ffe28c' : 'rgba(120,130,170,0.35)';
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fill();
+  }
+  text('stars carried', 104, 84, 13, 'rgba(232,228,255,0.75)', 'left', 'system-ui, sans-serif');
+  // score
+  text(`Score ${world.score}`, W - 30, 32, 22, '#ffe9b0', 'right', 'system-ui, sans-serif');
+  if (world.combo > 1) text(`combo ×${world.combo}`, W - 30, 60, 15, '#ffb3c8', 'right', 'system-ui, sans-serif');
+  // dawn bar
+  const bw = 380, bx = (W - bw) / 2, by = 24;
+  ctx.fillStyle = 'rgba(10,12,34,0.55)';
+  ctx.beginPath(); ctx.roundRect(bx - 8, by - 13, bw + 16, 26, 13); ctx.fill();
+  const dawn = clamp(1 - world.timeLeft / NIGHT_SECONDS, 0, 1);
+  const grad = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+  grad.addColorStop(0, '#5a6fd6'); grad.addColorStop(0.6, '#c65d8f'); grad.addColorStop(1, '#ffb35c');
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.roundRect(bx, by - 5, Math.max(10, bw * dawn), 10, 5); ctx.fill();
+  text('dawn', bx + bw + 18, by, 12, 'rgba(255,220,170,0.85)', 'left', 'system-ui, sans-serif');
+  text('night', bx - 18, by, 12, 'rgba(200,205,255,0.7)', 'right', 'system-ui, sans-serif');
+  const secs = Math.max(0, Math.ceil(world.timeLeft));
+  text(`${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`, W / 2, 58, 15, '#e8e4ff', 'center', 'system-ui, sans-serif');
+  if (world.paused) text('PAUSED — P to resume', W / 2, H / 2 - 120, 30, '#ffffff', 'center');
+}
+function panel(x, y, w, h, alpha = 0.82) {
+  ctx.fillStyle = `rgba(12,12,34,${alpha})`;
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, 18); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,214,140,0.35)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, 18); ctx.stroke();
+}
+function drawTitle() {
+  const cx = W / 2;
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,205,92,0.85)'; ctx.shadowBlur = 34;
+  text('THE LAST FIREFLY', cx, 128, 64, '#ffeec2', 'center');
+  ctx.restore();
+  text('She saved the brightest light for you.', cx, 178, 25, '#ffd0dd', 'center');
+  const lines = [
+    'Every night, Luma lights the valley’s nine lanterns before dawn.',
+    'Tonight is the last night of the season — and the great lantern',
+    'on the hill, the one with the ribbon, she has been saving',
+    'all season for one particular guest. For you.',
+  ];
+  lines.forEach((ln, i) => text(ln, cx, 248 + i * 27, 19, 'rgba(238,236,255,0.92)', 'center'));
+  const pulse = 0.65 + 0.35 * Math.sin(world.t * 2.4);
+  text('Click or press Enter to begin', cx, 420, 22, `rgba(255,233,176,${pulse.toFixed(3)})`, 'center', 'system-ui, sans-serif');
+  text('Mouse or WASD to fly · Catch star-drops · Touch a dark lantern to light it', cx, 640, 16, 'rgba(220,222,255,0.66)', 'center', 'system-ui, sans-serif');
+  text('Light all nine before dawn — then fly to the hill.  P pause · M mute', cx, 668, 16, 'rgba(220,222,255,0.66)', 'center', 'system-ui, sans-serif');
+}
+function drawWin() {
+  // the letter she leaves with the lantern
+  const px = W / 2 - 305, py = 118, pw = 610, ph = 420;
+  ctx.fillStyle = 'rgba(250,240,214,0.97)';
+  ctx.beginPath(); ctx.roundRect(px, py, pw, ph, 10); ctx.fill();
+  ctx.strokeStyle = 'rgba(146,110,52,0.6)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(px + 10, py + 10, pw - 20, ph - 20, 7); ctx.stroke();
+  // ribbon seal
+  ctx.fillStyle = '#c73e54';
+  ctx.beginPath(); ctx.arc(px + pw / 2, py + 34, 13, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#ffe9a8'; ctx.beginPath(); ctx.arc(px + pw / 2, py + 34, 5.5, 0, Math.PI * 2); ctx.fill();
+  const cx = px + pw / 2;
+  text('Dear friend who judged my work —', cx, py + 84, 23, '#4a3418', 'center');
+  const lines = [
+    'I lit nine small lights for the valley,',
+    'the way I do every night.',
+    'This tenth one I saved all season.',
+    'It is yours. Thank you for staying',
+    'until the end.',
+  ];
+  lines.forEach((ln, i) => text(ln, cx, py + 128 + i * 31, 21, '#5a4020', 'center'));
+  text('— Luma, the last firefly', cx, py + 306, 20, '#7a4a2a', 'center');
+  text(`Score ${world.score}`, cx, py + 348, 22, '#4a3418', 'center', 'system-ui, sans-serif');
+  text('Press R or click to play again', cx, py + 386, 15, 'rgba(90,64,32,0.66)', 'center', 'system-ui, sans-serif');
+}
+function drawLose() {
+  panel(W / 2 - 330, 210, 660, 250);
+  text('The sun rose first.', W / 2, 272, 38, '#ffe9c9', 'center');
+  text('Some lanterns stayed dark tonight — but Luma', W / 2, 322, 20, 'rgba(238,236,255,0.92)', 'center');
+  text('is not angry. She will be back tomorrow night,', W / 2, 350, 20, 'rgba(238,236,255,0.92)', 'center');
+  text('and the great lantern will still be waiting for you.', W / 2, 378, 20, 'rgba(238,236,255,0.92)', 'center');
+  text(`Score ${world.score} · ${world.lanternsLit} of 9 lanterns lit`, W / 2, 420, 19, '#ffe9b0', 'center', 'system-ui, sans-serif');
+  const pulse = 0.6 + 0.4 * Math.sin(world.t * 2.4);
+  text('Press R or click to try again', W / 2, 492, 19, `rgba(255,233,176,${pulse.toFixed(3)})`, 'center', 'system-ui, sans-serif');
+}
+
+// ---- render ----------------------------------------------------------------------
+function render() {
+  const dawn = dawnAmount();
+  ctx.save();
+  if (world.shake > 0) ctx.translate(rand(-1, 1) * world.shake * 6, rand(-1, 1) * world.shake * 6);
+  drawSky(dawn);
+  drawHills(dawn);
+  drawMeadow(dawn);
+  drawBigLantern();
+  for (const lan of world.lanterns) drawLantern(lan);
+  for (const s of world.stars) drawStarDrop(s);
+  for (const w of world.wisps) drawWisp(w);
+  drawFireflies();
+  if (world.screen !== 'win') drawLuma();
+  else { // on the win screen Luma rests beside her lantern
+    const keep = { ...world.luma };
+    world.luma = { ...keep, x: BIG.x - 66, y: BIG.y - 150, trail: [] };
+    drawLuma();
+    world.luma = keep;
+  }
+  drawParticles();
+  ctx.restore();
+  if (world.screen === 'play' || world.screen === 'finale') drawHUD();
+  if (world.screen === 'title') drawTitle();
+  if (world.screen === 'win') drawWin();
+  if (world.screen === 'lose') drawLose();
+  // vignette
+  const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.42, W / 2, H / 2, H * 0.95);
+  vg.addColorStop(0, 'rgba(4,4,18,0)'); vg.addColorStop(1, 'rgba(4,4,18,0.42)');
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+}
+
+// ---- shot scenes (the maker takes the entry's screenshots from these) ------------
+function setupShot(name) {
+  resetWorld(SEED);
+  const L = world.luma;
+  if (name === 'title') {
+    world.screen = 'title';
+    world.lanterns[1].lit = true; world.lanterns[4].lit = true; world.lanterns[7].lit = true;
+    L.x = 232; L.y = 402;
+    spawnStar(620); world.stars[0].y = 150;
+    spawnStar(880); world.stars[1].y = 90;
+  } else if (name === 'play') {
+    world.screen = 'play';
+    world.timeLeft = 96; world.score = 430; world.carried = 2; world.combo = 2;
+    for (const i of [0, 1, 3, 5]) { world.lanterns[i].lit = true; }
+    world.lanternsLit = 4;
+    L.x = 505; L.y = 300;
+    spawnStar(560); world.stars[0].y = 120;
+    spawnStar(760); world.stars[1].y = 210;
+    spawnStar(300); world.stars[2].y = 60;
+    spawnStar(985); const rest = world.stars[3]; rest.resting = true; rest.y = groundY(rest.x) - 8;
+    world.wisps[0].x = 830; world.wisps[0].y = 380;
+    world.wisps[1].x = 240; world.wisps[1].y = 170;
+    world.wisps[2].x = 1080; world.wisps[2].y = 240;
+    burst(468, groundY(454) - 32, 10, [255, 196, 92], 120, 1.4, 3);
+  } else if (name === 'late') {
+    world.screen = 'play';
+    world.timeLeft = 13; world.score = 1240; world.carried = 1; world.combo = 3;
+    for (let i = 0; i < 8; i++) world.lanterns[i].lit = true;
+    world.lanternsLit = 8;
+    L.x = 950; L.y = 330;
+    spawnStar(700); world.stars[0].y = 140;
+    world.wisps[0].x = 420; world.wisps[0].y = 220;
+    world.wisps[1].x = 1080; world.wisps[1].y = 330;
+    world.wisps[2].x = 160; world.wisps[2].y = 300;
+  } else if (name === 'finale') {
+    world.screen = 'win';
+    world.timeLeft = 41; world.score = 1845; world.carried = 0;
+    for (const lan of world.lanterns) lan.lit = true;
+    world.lanternsLit = 9;
+    L.x = BIG.x - 66; L.y = BIG.y - 150;
+    burst(BIG.x, BIG.y - 70, 24, [255, 214, 120], 160, 1.6, 3.6);
+  }
+  // let ambient motion settle a few frames, then declare ready
+  let frames = 0;
+  const tick = () => { if (++frames >= 8) { window.__shotReady = true; } else requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+}
+
+// ---- canvas sizing ------------------------------------------------------------------
+function resize() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const scale = Math.min(innerWidth / W, innerHeight / H);
+  canvas.width = Math.round(W * scale * dpr);
+  canvas.height = Math.round(H * scale * dpr);
+  canvas.style.width = `${Math.round(W * scale)}px`;
+  canvas.style.height = `${Math.round(H * scale)}px`;
+  canvas.style.left = `${Math.round((innerWidth - W * scale) / 2)}px`;
+  canvas.style.top = `${Math.round((innerHeight - H * scale) / 2)}px`;
+  canvas.style.position = 'fixed';
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+}
+addEventListener('resize', resize);
+resize();
+
+// mouse coordinates must account for the letterboxed canvas
+const _mm = (e) => {
+  const r = canvas.getBoundingClientRect();
+  input.mouseX = (e.clientX - r.left) / r.width * W;
+  input.mouseY = (e.clientY - r.top) / r.height * H;
+  input.mouseSeen = true;
+};
+addEventListener('mousemove', _mm);
+
+// ---- main loop -------------------------------------------------------------------------
+let last = performance.now();
+function frame(now) {
+  const dt = clamp((now - last) / 1000, 0, 0.05);
+  last = now;
+  if (input.clicked) {
+    if (world.screen === 'title') startGame(world.seed);
+    else if (world.screen === 'win' || world.screen === 'lose') startGame(world.seed + 1);
+    input.clicked = false;
+  }
+  if (world.screen === 'finale') updateFinale(dt);
+  else update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+const shotName = params.get('shot');
+if (shotName) setupShot(shotName);
+requestAnimationFrame(frame);
+
+// debug / test hook
+if (params.get('debug')) {
+  window.__firefly = {
+    world,
+    startGame,
+    groundY,
+    lanternCenter: (i) => ({ x: world.lanterns[i].x + 14, y: world.lanterns[i].y - 32 }),
+    bigCenter: () => ({ x: BIG.x, y: BIG.y - 57 }),
+    grantStar() { if (world.carried < 3) world.carried++; },
+    teleport(x, y) { world.luma.x = x; world.luma.y = y; world.luma.vx = 0; world.luma.vy = 0; input.mouseX = x; input.mouseY = y; input.mouseSeen = true; },
+  };
+}
+</script>
+</body>
+</html>
